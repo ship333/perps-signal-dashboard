@@ -1,0 +1,141 @@
+Vision & MVP scope (hyperfocus on one feature)
+
+One feature to ship: a real-time card that shows the single best long/short perp pair on Hyperliquid right now, with:
+
+hedge ratio, signal strength (z-score of the cointegrated spread), expected net edge (after fees + funding), and a 15-min sparkline of the spread
+
+last update timestamp + data freshness status
+
+no trade execution; display only via backend API from the backtesting/signal engine
+
+System architecture (minimal, production-lean)
+[Alchemy/GoldRush WS+HTTP]──┐
+                            │    (ingest events)
+                      [Ingestor] ─→ [Redis Stream]
+                            │                   ┌───────────────┐
+                            └─────────────→ [Backtester/Signal Engine] (Docker)
+                                                │ emits top pair
+                                                ↓
+                                           [FastAPI API]
+                                                ↓
+                                          [React Frontend]
+
+
+Key choices to go live quickly
+
+Single docker-compose with four services: ingestor, engine, api, frontend. One shared .env (with per-service overrides). You already have Python/Node pieces and metrics; keep it simple. 
+
+Redis Streams (or in-process queue) for decoupled, low-latency event fan-out without Kafka-level complexity.
+
+Prometheus metrics already noted in your README → keep and expand (ingest lag, engine loop duration, pair refresh cadence). 
+
+GoldRush/Alchemy as primary data (historical + synthesized order books) with your resilient Node client for fallbacks/health checks, wired behind a thin Python adapter (already described). 
+
+DRY-RUN execution kept (no live orders) until after MVP; we only surface signals. 
+
+Data layer & ingestion
+
+Live price/order book stream
+
+WS subscription from Alchemy/GoldRush feed(s). If only prices are available, continue order book synthesis (bids/asks from price + spread model) as your README suggests. Tag each tick with {symbol, best_bid, best_ask, mark, funding_estimate}. 
+
+Historical backfill & warm start
+
+Use your GoldRush historical exporter to seed a rolling window (e.g., 7–14 days) per symbol for quick warming of correlations/cointegration on container start. 
+
+Keep data in Parquet on local volume for speed + restart resilience (one file per symbol/day).
+
+Signal model (pairs with inverse trends, perps-aware)
+
+Objective: find pairs with stable negative dependence and a tradable, mean-reverting spread once hedged.
+
+Universe & normalization
+
+Symbols: Hyperliquid perps you support first (e.g., UBTC, UETH, etc.). Normalize to log returns and standardize to comparable scales.
+
+Pair discovery (rolling)
+
+Rolling Kendall/Spearman correlation (robust to outliers) over N_corr minutes; candidate if ρ ≤ −ρ* (e.g., ≤ −0.4).
+
+Hedge ratio via OLS on log price levels (or returns if levels are non-stationary): y = α + βx + ε.
+
+Safety check: cointegration
+
+ADF or Engle-Granger on spread ε_t = y_t − βx_t within N_coint window to confirm stationarity; filter pairs failing the test.
+
+Signal: z-score spread
+
+z_t = (ε_t − μ_ε)/σ_ε.
+
+Entry: |z| ≥ z_in; direction: if z ≫ 0 then short y/long x with hedge ratio β (and vice versa).
+
+Exit: |z| ≤ z_out (or time-based stop).
+
+Perps economics baked in
+
+Funding rates: pull or estimate per leg; edge = raw spread reversion PnL − fees − funding carry − slippage/impact.
+
+Fees: taker fee model; your backtester already charges 10 bps—parameterize by market. 
+
+Slippage model: half-spread + size-based impact from synthesized L2.
+
+Ranking
+
+Rank candidates by expected net edge over horizon H subject to liquidity (notional caps) and max leverage. Select top-1 for MVP.
+
+Backtesting/engine (event-driven, containerized)
+
+Upgrade your current backtester to an event-driven loop that:
+
+Ingests ticks (grouped per timestamp) → computes rolling stats → updates signals → publishes “top pair” snapshot. Your current CSV group-by loop is a good start; adapt it to stream processing. 
+
+Execution model upgrades (no live orders; simulation only):
+
+Existing fields for fees and optional gas/flash-loan premiums are present; keep them but default to 0 for perps. 
+
+Add slippage (half-spread + impact), funding accrual (per minute/hour on open legs), and mark-to-market equity (your equity curve is cash-only now; extend to unrealized PnL). 
+
+Support position netting by hedge ratio (y vs x) and risk caps (max notional per leg, max portfolio leverage).
+
+Outputs (for API/UI)
+
+top_pair: {baseA, baseB, sideA, sideB, beta, zscore, expected_edge_bps, funding_bps_h, fee_bps, slippage_bps, spreadSparkline[], updated_at}
+
+Persist last 100 snapshots in SQLite (simple, bundled) for the UI sparkline.
+
+API (FastAPI) & contracts
+
+Keep FastAPI; expose two endpoints + one WS topic:
+
+GET /pairs/top → returns current top_pair snapshot (+ 15-min sparkline & metadata).
+
+GET /pairs/top/history?window=15m → returns list of snapshots for sparkline.
+
+WS /ws/top → pushes updates when top pair changes or refresh interval elapses.
+Your README already defines API skeleton/docs and Prometheus metrics; build on that. 
+
+Frontend (React) — minimal, production-lean
+
+One page “Top Hedged Pair Right Now.”
+
+Large card with pair symbols, Long/Short badges per leg, hedge ratio β, z-score gauge, expected edge (bps and $/notional), funding impact, last updated.
+
+15-min sparkline (spread z) with entry/exit markers if present.
+
+Status chip for data freshness (green < 2s; amber < 10s; red stale).
+
+Use your existing frontend/ scaffolding and dev scripts (already in the repo) for speed. 
+
+Observability, reliability & ops
+
+Health checks:
+
+Ingestor WS connected, lag ≤ threshold; Engine loop time; API latency.
+
+Metrics (Prometheus): ingest tick rate, queue depth, time-to-signal, top_pair churn rate, zscore distribution. Your metrics port is already set up—extend it. 
+
+Resilience:
+
+Keep your Node/TS GoldRush client with endpoint rotation & circuit breaker; it’s perfect for flaky networks, and you already outlined it. 
+
+Config & secrets: single .env with Alchemy keys, HyperEVM RPC, symbols, etc., as you documented.
